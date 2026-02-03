@@ -1,0 +1,384 @@
+// スクリプトプロパティからAPIキーを取得
+const API_KEY = PropertiesService.getScriptProperties().getProperty('GEMINI_API_KEY');
+
+// Gemini APIのエンドポイント
+const API_ENDPOINT = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent?key=${API_KEY}`;
+
+// ★変更点：新しいスプレッドシートのIDを定義
+const TARGET_SPREADSHEET_ID = '1ZcG6_gobI_JQoQigjShIJITNmdccYmSqAcrkArohiSY';
+
+// プロンプトのテンプレート
+const PROMPT_TEMPLATE = `
+以下のテキストデータを解析し、AppSheetでの利用に適した親子関係の2つのテーブル形式で出力してください。
+出力はMarkdownテーブル形式で、最初に親テーブル、次に子テーブルを出力してください。
+親テーブルの見出しは「親テーブル：案件詳細 (AnkenDetails)」、子テーブルの見出しは「子テーブル：協力会社詳細 (KyoryokuGaishaDetails)」としてください。
+
+【入力テキストデータ】
+###INPUT_TEXT_DATA_PLACEHOLDER###
+
+【出力仕様】
+
+1.  親テーブル：案件詳細 (AnkenDetails)
+    以下の列構成で作成してください。
+    * ID: 各案件に、AppSheetで主キーとして使用できるようなランダムでユニークな文字列IDを割り振ってください。
+    * 日付: 入力テキストの最初の日付情報をYYYY/MM/DD 形式で記載してください。年は今年の年（${new Date().getFullYear()}年）を使用してください。
+    * 現場名: 入力テキストの各案件の現場名を記載してください。
+    * 人数: 入力テキストの各案件の総人数を記載してください。
+    * 会社名: 入力テキストの各案件の企業名を記載してください。企業名に「常用」という文言が含まれる場合は、それを除いた部分のみを記載してください。企業名の記載がない場合は空欄にしてください。
+    * 出勤: 入力テキストの各案件の出勤職人のうち、協力会社ではない自社職人の名前をカンマ区切りで記載してください（例: 職人A, 職人B）。該当者がない場合は空欄にしてください。
+    * 車: 入力テキストの各案件の車番とETC情報をカンマ区切りで結合して記載してください（例: 車番1, ETC情報）。車番のみの場合は車番を、ETC情報のみの場合はETC情報を記載し、両方ない場合は空欄にしてください。「6時20分集合」や「各社直」、「直」といった備考情報は含めないでください。
+
+2.  子テーブル：協力会社詳細 (KyoryokuGaishaDetails)
+    以下の列構成で作成してください。協力会社情報がない案件については、このテーブルにレコードを作成する必要はありません。
+    * 協力会社ID: 各協力会社の稼働情報に、AppSheetで主キーとして使用できるようなランダムでユニークな文字列IDを割り振ってください。
+    * ID: 親テーブル「案件詳細」の**該当案件**の IDを記載してください。
+    * 協力会社出勤: 入力テキストの出勤職人リストのうち、「(協力会社名)(数字)」の形式で記載されている部分の「協力会社名」を記載してください。
+    * 人数: 上記「(協力会社名)(数字)」の形式の「数字」部分（協力会社からの出勤人数）を記載してください。
+
+【データ解釈の補足ルール】
+* 入力テキストの「休み」および「帰国」に関する情報は完全に無視してください。
+* **最重要ルール：** 協力会社（子テーブルのデータ）の判定は、**各案件の「出勤職人リスト」の行に対してのみ行ってください。**
+* **さらに強調します：** 各案件の最初の行にある「現場名 人数」（例: "三木 1", "葛城 2", "運送 1", "LOGI南港 12", "KM心斎橋 1", "星住邸 2", "瓜生山 2", "矢田部住宅 5"）のようなパターンは、**現場名とその現場の総人数を表しており、絶対に協力会社として扱わないでください。** 協力会社と判断するのは、「出勤職人リスト」内でのみ「文字列+数字」の形式（例: \`三木2\`）となっている要素に限ります。
+* 出勤職人リストはスペースで区切られています。リスト内の各要素について以下のように判断してください。
+    * 要素が「文字列数字」（スペースを挟まずに名前の直後に数字が続く形式）の場合のみ、それを「協力会社名 人数」と解釈し、子テーブルのデータとします。この「文字列」部分が協力会社名、「数字」部分が人数です。
+    * 上記以外の場合（例:数字がない、または名前と数字の間にスペースがある）は、その要素全体を自社職人の名前または単なる情報として解釈し、親テーブルの「出勤」列に記載します。
+* 協力会社かどうかを判断する唯一の基準は、**各案件の出勤職人リストの個々の名前が「名前+数字」の形式（例: \`三木2\`）になっているかどうかです。** 1行目の現場名の行に「常用」という言葉が含まれていても、それだけを理由に出勤職人を協力会社として扱わないでください。
+
+上記の指示に従って、2つのテーブルを明確に分けて提示してください。
+`;
+
+
+/**
+ * マスタシートからデータを読み込み、検索用のマップ（連想配列）を作成するヘルパー関数
+ * @param {string} sheetName マスタシート名
+ * @param {number} keyColumnIndex キーとして使用する列のインデックス（0から始まる）
+ * @param {number} valueColumnIndex 値として使用する列のインデックス（0から始まる）
+ * @return {object} { キー: 値 } の形式のオブジェクト
+ */
+function _createMasterMap(sheetName, keyColumnIndex, valueColumnIndex) {
+  Logger.log(`_createMasterMap: シート「${sheetName}」の読み込みを開始。`);
+  // マスタシートは指定されたIDのスプレッドシートから開く
+  const ss = SpreadsheetApp.openById(TARGET_SPREADSHEET_ID);
+  const sheet = ss.getSheetByName(sheetName);
+  if (!sheet) {
+    Logger.log(`警告: マスタシート「${sheetName}」が見つかりません。空のマップを返します。`);
+    return {};
+  }
+  const data = sheet.getDataRange().getValues();
+  const map = {};
+  // ヘッダー行をスキップするため、i=1から開始
+  for (let i = 1; i < data.length; i++) {
+    let key = data[i][keyColumnIndex];
+    const value = data[i][valueColumnIndex];
+    if (key && key !== "") {
+      
+      // 「会社マスタ」の場合のみ、キーから会社種別の接頭辞・接尾辞を削除
+      if (sheetName === "会社マスタ") {
+        // "㈱", "(株)", "株式会社" などのパターンを定義
+        const companyTypePattern = "(㈱|㈲|\\(株\\)|\\(有\\)|（株）|（有）|株式会社|有限会社|合同会社)";
+        
+        // 1. 名前の先頭からパターンを削除
+        key = key.replace(new RegExp(`^${companyTypePattern}`), '');
+        
+        // 2. 名前の末尾からパターンを削除
+        key = key.replace(new RegExp(`${companyTypePattern}$`), '');
+        
+        // 3. 前後の空白を削除
+        key = key.trim();
+      }
+
+      map[key] = value;
+    }
+  }
+  Logger.log(`_createMasterMap: シート「${sheetName}」の読み込みが完了しました。項目数: ${Object.keys(map).length}`);
+  return map;
+}
+
+
+/**
+ * AppSheetからの追加など、シートの変更をきっかけに実行されるメイン関数。
+ * 「処理ステータス」列が空の行をすべて探し出し、処理を実行します。
+ */
+function processAppSheetEntries() {
+  Logger.log("processAppSheetEntries 関数が開始されました。"); 
+
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName("メッセージ取得");
+  if (!sheet) {
+    Logger.log("エラー: シート「メッセージ取得」が見つかりません。スクリプトを終了します。");
+    return;
+  }
+  
+  // 会社マスタは従来通りマップとして読み込む
+  const kaishaMasterMap = _createMasterMap("会社マスタ", 1, 0);
+
+  // ★★★ 変更点 ★★★
+  // 現場マスタは複数列を条件検索するため、単純なマップではなく二次元配列として全データを読み込む
+  const ssMaster = SpreadsheetApp.openById(TARGET_SPREADSHEET_ID);
+  const genbaMasterSheet = ssMaster.getSheetByName("現場マスタ");
+  // ヘッダー行を除いたA列からC列のデータを取得 (A列:現場コード, B列:会社コード, C列:現場名)
+  const genbaMasterData = genbaMasterSheet ? genbaMasterSheet.getRange(2, 1, genbaMasterSheet.getLastRow() - 1, 3).getValues() : [];
+  Logger.log(`現場マスタから ${genbaMasterData.length} 件のデータを読み込みました。`);
+
+
+  const dataColumn = 2;
+  const statusColumn = 3;
+  const startRow = 2;
+  if (sheet.getLastRow() < startRow) {
+    Logger.log("処理対象データがありません。");
+    return;
+  }
+  
+  const dataRange = sheet.getRange(startRow, 1, sheet.getLastRow() - startRow + 1, statusColumn);
+  const values = dataRange.getValues();
+  
+  const demenSheet = ssMaster.getSheetByName("出面");
+  let nextId = 1; 
+  if (demenSheet) {
+    // (最終IDを取得するロジックは変更なし)
+    const lastRow = demenSheet.getLastRow();
+    if (lastRow > 1) { 
+      const lastId = demenSheet.getRange(lastRow, 1).getValue();
+      if (!isNaN(lastId) && lastId !== "") {
+        nextId = parseInt(lastId, 10) + 1;
+      } else {
+        const idList = demenSheet.getRange(2, 1, lastRow - 1, 1).getValues().flat();
+        let maxId = 0;
+        for (const idStr of idList) {
+          if (!isNaN(idStr) && idStr !== "") {
+            maxId = Math.max(maxId, parseInt(idStr, 10));
+          }
+        }
+        nextId = maxId + 1;
+      }
+    }
+    Logger.log(`次のIDは ${nextId} から開始します。`);
+  } else {
+    Logger.log("エラー: シート「出面」が見つかりません。");
+  }
+
+  for (let i = 0; i < values.length; i++) {
+    const status = values[i][statusColumn - 1];
+    const currentRowInSheet = startRow + i;
+    
+    if (status === "") {
+      const inputTextData = values[i][dataColumn - 1];
+      
+      if (inputTextData && typeof inputTextData === 'string' && inputTextData.trim() !== "") {
+        sheet.getRange(currentRowInSheet, statusColumn).setValue("処理中...");
+        SpreadsheetApp.flush();
+
+        const filledPrompt = PROMPT_TEMPLATE.replace("###INPUT_TEXT_DATA_PLACEHOLDER###", inputTextData);
+        const geminiResponse = callGeminiApi(filledPrompt);
+
+        if (geminiResponse && !geminiResponse.startsWith("エラー:") && !geminiResponse.startsWith("APIエラー:")) {
+          const { parentData, childData } = parseGeminiResponseToTables(geminiResponse);
+          
+          const idMap = {};
+
+          if (parentData.length > 0 && demenSheet) {
+            const rowsToWrite = [];
+            for (const row of parentData) {
+              const geminiId = row[0];
+              const [_, date, genbaName, ninzu, kaishaName, shukkin, kuruma] = row;
+
+              // 会社コードの取得ロジック（これは変更なし）
+              const kaishaCode = kaishaName.trim() === "" ? "" : (kaishaMasterMap[kaishaName] ? kaishaMasterMap[kaishaName] : `⚠️ ${kaishaName}`);
+
+              // ★★★ 変更点 ★★★
+              // 新しいロジックで現場コードを検索する
+              let genbaCode = "";
+              if (genbaName.trim() !== "") {
+                const companyCodeForSearch = kaishaMasterMap[kaishaName]; // マスタ検索用の純粋な会社コードを取得
+                if (companyCodeForSearch) {
+                   // 会社コードと現場名を使って現場マスタを検索する
+                   genbaCode = findGenbaCode(companyCodeForSearch, genbaName, genbaMasterData);
+                }
+                
+                // それでも見つからなければエラー表示
+                if (!genbaCode) {
+                    genbaCode = `⚠️ ${genbaName}`;
+                }
+              }
+              // ★★★ 変更点はここまで ★★★
+
+              const assignedId = nextId; 
+              idMap[geminiId] = assignedId;
+              nextId++;
+
+              const newRow = new Array(26).fill('');
+              newRow[0] = assignedId;
+              newRow[1] = date;
+              newRow[7] = kaishaCode;  // 最終的な会社名はkaishaCode（⚠️付きの場合もある）
+              newRow[8] = genbaCode;   // 新しいロジックで取得した現場コード
+              newRow[9] = shukkin;
+              newRow[11] = ninzu;
+              newRow[26] = kuruma;
+              rowsToWrite.push(newRow);
+            }
+            const appendStartRow = demenSheet.getLastRow() + 1;
+            demenSheet.getRange(appendStartRow, 1, rowsToWrite.length, 27).setValues(rowsToWrite);
+          }
+          
+          if (childData.length > 0) {
+            const updatedChildData = childData.map(childRow => {
+              const geminiParentId = childRow[1];
+              const correctParentId = idMap[geminiParentId];
+              if (correctParentId) {
+                 childRow[1] = correctParentId;
+              } else {
+                 childRow[1] = "親ID不明";
+              }
+              return childRow;
+            });
+            appendDataToSheet("協力会社集計", updatedChildData);
+          }
+          
+          sheet.getRange(currentRowInSheet, statusColumn).setValue("処理済み");
+        } else {
+          sheet.getRange(currentRowInSheet, statusColumn).setValue(`エラー: ${geminiResponse}`);
+        }
+      }
+    }
+  }
+  Logger.log("processAppSheetEntries 関数が終了しました。");
+}
+
+
+/**
+ * 現場マスタのデータ配列から、指定された会社コードと現場名に一致する現場コードを検索する
+ * @param {string} companyCode - 検索する会社コード
+ * @param {string} siteName - 検索する現場名
+ * @param {Array<Array<string>>} masterData - 現場マстаの全データ（二次元配列）
+ * @return {string|null} - 一致する現場コードが見つかればそのコードを、見つからなければnullを返す
+ */
+function findGenbaCode(companyCode, siteName, masterData) {
+  if (!companyCode || !siteName) {
+    return null;
+  }
+  
+  for (const row of masterData) {
+    const masterSiteCode = row[0]; // A列: 現場コード
+    const masterCompanyCode = row[1]; // B列: 会社コード
+    const masterSiteName = row[2]; // C列: 現場名
+
+    // B列の会社コードとC列の現場名が両方一致するかチェック
+    if (masterCompanyCode == companyCode && masterSiteName == siteName) {
+      return masterSiteCode; // 一致したらA列の現場コードを返す
+    }
+  }
+
+  return null; // ループ内で一致するものがなければnullを返す
+}
+
+
+/**
+ * Gemini APIにプロンプトを送信し、結果を取得する関数
+ */
+function callGeminiApi(promptText) {
+  Logger.log("callGeminiApi: APIリクエストを構築中...");
+  const payload = {
+    "contents": [{"parts": [{"text": promptText}]}],
+    "generationConfig": {"temperature": 0.2, "maxOutputTokens": 8192}
+  };
+  const options = {
+    'method': 'post',
+    'contentType': 'application/json',
+    'payload': JSON.stringify(payload),
+    'muteHttpExceptions': true
+  };
+  Logger.log("callGeminiApi: APIエンドポイントへフェッチを開始します。");
+  try {
+    const response = UrlFetchApp.fetch(API_ENDPOINT, options);
+    const responseCode = response.getResponseCode();
+    const responseBody = response.getContentText();
+    Logger.log(`callGeminiApi: レスポンスコード: ${responseCode}`);
+    if (responseCode === 200) {
+      const jsonResponse = JSON.parse(responseBody);
+      if (jsonResponse.candidates && jsonResponse.candidates[0] && jsonResponse.candidates[0].content && jsonResponse.candidates[0].content.parts && jsonResponse.candidates[0].content.parts[0]) {
+        Logger.log("callGeminiApi: APIレスポンスが成功し、内容を返します。");
+        return jsonResponse.candidates[0].content.parts[0].text;
+      } else {
+        Logger.log('エラー: callGeminiApi: 予期しないレスポンス構造です: ' + responseBody);
+        return 'エラー: 予期しないレスポンス構造です。';
+      }
+    } else {
+      Logger.log(`APIエラー: callGeminiApi: ${responseCode} - ${responseBody}`);
+      return `APIエラー: ${responseCode}`;
+    }
+  } catch (error) {
+    Logger.log('通信エラー: callGeminiApi: ' + error.toString());
+    return 'エラー: 通信エラー';
+  }
+}
+
+
+/**
+ * Gemini APIからのMarkdownテーブル形式のレスポンスを解析する関数
+ */
+function parseGeminiResponseToTables(responseText) {
+  Logger.log("parseGeminiResponseToTables: レスポンステキストの解析を開始。");
+  const parentData = [];
+  const childData = [];
+  const parentHeaderMarker = "親テーブル：案件詳細 (AnkenDetails)";
+  const childHeaderMarker = "子テーブル：協力会社詳細 (KyoryokuGaishaDetails)";
+  let currentTableData = null;
+  let inTableParsingMode = false;
+  const lines = responseText.split('\n');
+  for (const line of lines) {
+    const trimmedLine = line.trim();
+    if (trimmedLine.includes(parentHeaderMarker)) {
+      currentTableData = parentData;
+      inTableParsingMode = false;
+      continue;
+    } else if (trimmedLine.includes(childHeaderMarker)) {
+      currentTableData = childData;
+      inTableParsingMode = false;
+      continue;
+    }
+    if (currentTableData) {
+      if (trimmedLine.startsWith('|') && trimmedLine.endsWith('|')) {
+        if (trimmedLine.includes('---')) {
+          inTableParsingMode = true;
+          continue;
+        }
+        if (!inTableParsingMode) continue;
+        const cells = trimmedLine.split('|').map(cell => cell.trim());
+        if (cells.length > 2) currentTableData.push(cells.slice(1, -1));
+      }
+    }
+  }
+  Logger.log(`parseGeminiResponseToTables: 解析完了。親データ行数: ${parentData.length}, 子データ行数: ${childData.length}`);
+  return { parentData, childData };
+}
+
+
+/**
+ * 指定されたシートの最終行にデータを追記する関数
+ */
+function appendDataToSheet(sheetName, dataArray) {
+  Logger.log(`appendDataToSheet: シート「${sheetName}」へのデータ追記を開始。`);
+  if (!dataArray || dataArray.length === 0) {
+    Logger.log(`appendDataToSheet: ${sheetName} に追記するデータがありません。`);
+    return;
+  }
+  if (!dataArray[0] || dataArray[0].length === 0) {
+    Logger.log(`appendDataToSheet: ${sheetName} に追記するデータの列がありません。`);
+    return;
+  }
+  try {
+    // データ追記先のシートは指定されたIDのスプレッドシートから開く
+    const ss = SpreadsheetApp.openById(TARGET_SPREADSHEET_ID);
+    const sheet = ss.getSheetByName(sheetName);
+    if (sheet) {
+      const startRow = sheet.getLastRow() + 1;
+      sheet.getRange(startRow, 1, dataArray.length, dataArray[0].length).setValues(dataArray);
+      Logger.log(`${dataArray.length}件のデータを「${sheetName}」シートに転記しました。`);
+    } else {
+      Logger.log(`エラー: appendDataToSheet: シート「${sheetName}」が見つかりません。`);
+    }
+  } catch (e) {
+    Logger.log(`エラー: appendDataToSheet: シート「${sheetName}」へのデータ追記中にエラーが発生しました: ${e.toString()}\nデータ: ${JSON.stringify(dataArray)}`);
+  }
+  Logger.log(`appendDataToSheet: シート「${sheetName}」へのデータ追記が完了。`);
+}
