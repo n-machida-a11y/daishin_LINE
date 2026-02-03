@@ -1,0 +1,232 @@
+/**
+ * LINE WORKS Bot (API 2.0) 用 GASコード (ライブラリ不要版)
+ * * ★ ライブラリの追加は不要です。標準機能だけで動作します。
+ */
+
+// スクリプトプロパティの読み込み
+const PROPS = PropertiesService.getScriptProperties();
+
+// 設定値（プロパティから取得）
+const TARGET_USER_ID = PROPS.getProperty('USER_ID'); // 特定のユーザーID
+const BOT_ID = PROPS.getProperty('BOT_ID');
+
+/**
+ * ログを「Debug」シートに書き込む関数
+ */
+function debugLog(text) {
+  try {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    let sheet = ss.getSheetByName('Debug');
+    if (!sheet) {
+      sheet = ss.insertSheet('Debug'); // なければ作る
+      sheet.appendRow(['日時', 'ログ内容']); // ヘッダー
+    }
+    sheet.appendRow([new Date(), text]);
+  } catch (e) {
+    console.error("ログ書き込み失敗: " + e.toString());
+  }
+}
+
+/**
+ * 1. LINE WORKSからのメッセージを受信する関数 (Webhook)
+ */
+function doPost(e) {
+  debugLog("🚀 doPost受信開始");
+
+  if (!e || !e.postData) {
+    debugLog("❌ エラー: postDataがありません");
+    return ContentService.createTextOutput("No postData");
+  }
+
+  let eventData;
+  try {
+    eventData = JSON.parse(e.postData.contents);
+    debugLog("📩 受信データ: " + e.postData.contents);
+  } catch (error) {
+    debugLog("❌ JSON解析エラー: " + error.toString());
+    return ContentService.createTextOutput("Error: Invalid JSON").setMimeType(ContentService.MimeType.TEXT);
+  }
+
+  const senderId = eventData.source ? eventData.source.userId : "不明";
+
+  // ユーザーIDの一致チェック
+  if (senderId === TARGET_USER_ID) {
+    debugLog("✅ ターゲットユーザー一致: " + senderId);
+
+    if (eventData.type === 'message' && eventData.content.type === 'text') {
+      const messageText = eventData.content.text;
+
+      try {
+        // スプレッドシート（アクティブなシート）に書き込み
+        const sheet = SpreadsheetApp.getActive().getActiveSheet();
+        sheet.appendRow([
+          new Date(),
+          messageText
+        ]);
+        debugLog("📝 メインシートへの書き込み完了: " + messageText);
+        SpreadsheetApp.flush(); 
+
+      } catch (sheetError) {
+        debugLog("❌ メインシート書き込みエラー: " + sheetError.toString());
+        sendMessage(senderId, "⚠️ エラー: シート書き込み失敗\n" + sheetError.toString());
+        return ContentService.createTextOutput("Sheet Error").setMimeType(ContentService.MimeType.TEXT);
+      }
+
+      // 外部関数の呼び出し
+      if (typeof processAppSheetEntries === 'function') {
+        debugLog("🔄 processAppSheetEntries を実行します");
+        try {
+          processAppSheetEntries();
+          debugLog("✅ processAppSheetEntries 完了");
+        } catch (err) {
+          debugLog("❌ processAppSheetEntries エラー: " + err.toString());
+          sendMessage(senderId, "⚠️ 連携処理エラー:\n" + err.toString());
+        }
+      } else {
+        debugLog("⚠️ processAppSheetEntries関数が見つかりません");
+      }
+
+      return ContentService.createTextOutput("OK").setMimeType(ContentService.MimeType.TEXT);
+
+    } else {
+      debugLog("ℹ️ テキスト以外のメッセージ: " + eventData.type);
+      sendMessage(senderId, "ℹ️ テキストメッセージ以外は保存されません。");
+      return ContentService.createTextOutput("OK").setMimeType(ContentService.MimeType.TEXT);
+    }
+
+  } else {
+    // ID不一致の場合
+    debugLog("🚫 ID不一致拒否: 送信者=" + senderId + " / 設定値=" + TARGET_USER_ID);
+    sendMessage(senderId, "⚠️ エラー: IDが一致しません。\n\nあなたのID: " + senderId + "\n設定されたID: " + TARGET_USER_ID + "\n\nGASのUSER_IDを修正してください。");
+    return ContentService.createTextOutput("Ignored").setMimeType(ContentService.MimeType.TEXT);
+  }
+}
+
+/**
+ * 2. テスト送信用の関数
+ */
+function sendTestMessage() {
+  const userId = PROPS.getProperty('USER_ID');
+  debugLog("🔧 テスト送信実行: " + userId + " 宛て");
+  
+  if (!userId) {
+    debugLog("❌ エラー: USER_ID未設定");
+    return;
+  }
+  sendMessage(userId, "GASからのテスト送信成功です！Botの設定は正常です。🎉");
+}
+
+/**
+ * 3. メッセージ送信の実行関数
+ */
+function sendMessage(userId, text) {
+  try {
+    const token = getAccessToken();
+    const botId = PROPS.getProperty('BOT_ID');
+    const url = `https://www.worksapis.com/v1.0/bots/${botId}/users/${userId}/messages`;
+    
+    const payload = {
+      content: {
+        type: 'text',
+        text: text
+      }
+    };
+
+    const options = {
+      method: 'post',
+      headers: {
+        'Authorization': 'Bearer ' + token,
+        'Content-Type': 'application/json'
+      },
+      payload: JSON.stringify(payload),
+      muteHttpExceptions: true
+    };
+
+    const response = UrlFetchApp.fetch(url, options);
+    const resCode = response.getResponseCode();
+    
+    if (resCode === 201) {
+      debugLog("📤 送信成功: " + text);
+    } else {
+      debugLog("❌ 送信失敗 (Code " + resCode + "): " + response.getContentText());
+    }
+    
+  } catch (e) {
+    debugLog("❌ sendMessage関数エラー: " + e.toString());
+  }
+}
+
+/**
+ * 4. アクセストークン取得関数 (ライブラリ不使用版)
+ * GAS標準機能のみでJWTを生成します
+ */
+function getAccessToken() {
+  const privateKey = PROPS.getProperty('PRIVATE_KEY');
+  const clientId = PROPS.getProperty('CLIENT_ID');
+  const serviceAccount = PROPS.getProperty('SERVICE_ACCOUNT');
+  
+  if (!privateKey || !clientId || !serviceAccount) {
+    throw new Error("プロパティ設定不備");
+  }
+
+  // 1. ヘッダー作成
+  const header = {
+    alg: 'RS256',
+    typ: 'JWT'
+  };
+
+  // 2. クレームセット作成
+  const now = Math.floor(Date.now() / 1000);
+  const claim = {
+    iss: clientId,
+    sub: serviceAccount,
+    iat: now,
+    exp: now + 3600
+  };
+  
+  // 3. 署名生成 (ライブラリを使わずGAS標準機能で実装)
+  const toSign = base64UrlEncode(JSON.stringify(header)) + '.' + base64UrlEncode(JSON.stringify(claim));
+  const signatureBytes = Utilities.computeRsaSha256Signature(toSign, privateKey);
+  const signature = base64UrlEncode(signatureBytes);
+  const jwt = toSign + '.' + signature;
+
+  // 4. トークン要求
+  const url = 'https://auth.worksmobile.com/oauth2/v2.0/token';
+  const payload = {
+    grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+    assertion: jwt,
+    client_id: clientId,
+    client_secret: PROPS.getProperty('CLIENT_SECRET'),
+    scope: 'bot'
+  };
+
+  const options = {
+    method: 'post',
+    payload: payload,
+    muteHttpExceptions: true
+  };
+
+  const response = UrlFetchApp.fetch(url, options);
+  const json = JSON.parse(response.getContentText());
+  
+  if (json.error) {
+    throw new Error("トークン取得APIエラー: " + json.error);
+  }
+  return json.access_token;
+}
+
+/**
+ * ヘルパー関数: Base64URLエンコード
+ */
+function base64UrlEncode(input) {
+  let bytes;
+  if (typeof input === 'string') {
+    bytes = Utilities.newBlob(input).getBytes();
+  } else {
+    bytes = input;
+  }
+  return Utilities.base64Encode(bytes)
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/, '');
+}
