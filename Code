@@ -1,232 +1,223 @@
 /**
- * LINE WORKS Bot (API 2.0) 用 GASコード (ライブラリ不要版)
- * * ★ ライブラリの追加は不要です。標準機能だけで動作します。
+ * ■ コード.gs : メイン処理と設定
+ * ・LINEからの受信 (doPost)
+ * ・定期実行フロー (processAppSheetEntries)
+ * ・LINEへの返信 (sendMessage)
  */
 
-// スクリプトプロパティの読み込み
+// ==================================================
+// 1. 設定・定数
+// ==================================================
 const PROPS = PropertiesService.getScriptProperties();
-
-// 設定値（プロパティから取得）
-const TARGET_USER_ID = PROPS.getProperty('USER_ID'); // 特定のユーザーID
+const TARGET_USER_ID = PROPS.getProperty('USER_ID'); 
 const BOT_ID = PROPS.getProperty('BOT_ID');
+const TARGET_SPREADSHEET_ID = '1ZcG6_gobI_JQoQigjShIJITNmdccYmSqAcrkArohiSY';
 
-/**
- * ログを「Debug」シートに書き込む関数
- */
-function debugLog(text) {
-  try {
-    const ss = SpreadsheetApp.getActiveSpreadsheet();
-    let sheet = ss.getSheetByName('Debug');
-    if (!sheet) {
-      sheet = ss.insertSheet('Debug'); // なければ作る
-      sheet.appendRow(['日時', 'ログ内容']); // ヘッダー
-    }
-    sheet.appendRow([new Date(), text]);
-  } catch (e) {
-    console.error("ログ書き込み失敗: " + e.toString());
-  }
-}
-
-/**
- * 1. LINE WORKSからのメッセージを受信する関数 (Webhook)
- */
+// ==================================================
+// 2. 受信機能 (doPost)
+// ==================================================
 function doPost(e) {
-  debugLog("🚀 doPost受信開始");
-
-  if (!e || !e.postData) {
-    debugLog("❌ エラー: postDataがありません");
-    return ContentService.createTextOutput("No postData");
-  }
+  if (!e || !e.postData) return ContentService.createTextOutput("No postData");
 
   let eventData;
   try {
     eventData = JSON.parse(e.postData.contents);
-    debugLog("📩 受信データ: " + e.postData.contents);
   } catch (error) {
-    debugLog("❌ JSON解析エラー: " + error.toString());
-    return ContentService.createTextOutput("Error: Invalid JSON").setMimeType(ContentService.MimeType.TEXT);
+    return ContentService.createTextOutput("Error: Invalid JSON");
   }
 
   const senderId = eventData.source ? eventData.source.userId : "不明";
 
-  // ユーザーIDの一致チェック
   if (senderId === TARGET_USER_ID) {
-    debugLog("✅ ターゲットユーザー一致: " + senderId);
-
     if (eventData.type === 'message' && eventData.content.type === 'text') {
       const messageText = eventData.content.text;
 
       try {
-        // スプレッドシート（アクティブなシート）に書き込み
-        const sheet = SpreadsheetApp.getActive().getActiveSheet();
-        sheet.appendRow([
-          new Date(),
-          messageText
-        ]);
-        debugLog("📝 メインシートへの書き込み完了: " + messageText);
-        SpreadsheetApp.flush(); 
-
-      } catch (sheetError) {
-        debugLog("❌ メインシート書き込みエラー: " + sheetError.toString());
-        sendMessage(senderId, "⚠️ エラー: シート書き込み失敗\n" + sheetError.toString());
-        return ContentService.createTextOutput("Sheet Error").setMimeType(ContentService.MimeType.TEXT);
-      }
-
-      // 外部関数の呼び出し
-      if (typeof processAppSheetEntries === 'function') {
-        debugLog("🔄 processAppSheetEntries を実行します");
-        try {
-          processAppSheetEntries();
-          debugLog("✅ processAppSheetEntries 完了");
-        } catch (err) {
-          debugLog("❌ processAppSheetEntries エラー: " + err.toString());
-          sendMessage(senderId, "⚠️ 連携処理エラー:\n" + err.toString());
+        const ss = SpreadsheetApp.getActiveSpreadsheet();
+        let sheet = ss.getSheetByName('メッセージ取得');
+        if (!sheet) {
+          sheet = ss.insertSheet('メッセージ取得');
+          sheet.appendRow(['日時', 'メッセージ内容', '処理ステータス']);
         }
-      } else {
-        debugLog("⚠️ processAppSheetEntries関数が見つかりません");
+        sheet.appendRow([new Date(), messageText, ""]);
+        SpreadsheetApp.flush();
+      } catch (sheetError) {
+        try { sendMessage(senderId, "⚠️ 保存失敗: " + sheetError.toString()); } catch (e) {}
       }
-
-      return ContentService.createTextOutput("OK").setMimeType(ContentService.MimeType.TEXT);
-
-    } else {
-      debugLog("ℹ️ テキスト以外のメッセージ: " + eventData.type);
-      sendMessage(senderId, "ℹ️ テキストメッセージ以外は保存されません。");
       return ContentService.createTextOutput("OK").setMimeType(ContentService.MimeType.TEXT);
     }
+  }
+  return ContentService.createTextOutput("Ignored");
+}
 
-  } else {
-    // ID不一致の場合
-    debugLog("🚫 ID不一致拒否: 送信者=" + senderId + " / 設定値=" + TARGET_USER_ID);
-    sendMessage(senderId, "⚠️ エラー: IDが一致しません。\n\nあなたのID: " + senderId + "\n設定されたID: " + TARGET_USER_ID + "\n\nGASのUSER_IDを修正してください。");
-    return ContentService.createTextOutput("Ignored").setMimeType(ContentService.MimeType.TEXT);
+// ==================================================
+// 3. 定期実行処理 (processAppSheetEntries)
+// ==================================================
+function processAppSheetEntries() {
+  const startTime = new Date().getTime();
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName("メッセージ取得");
+  if (!sheet) return;
+
+  // マスタ読み込み
+  const kaishaMasterMap = _createMasterMap("会社マスタ", 1, 0);
+  const ssMaster = SpreadsheetApp.openById(TARGET_SPREADSHEET_ID);
+  const genbaMasterSheet = ssMaster.getSheetByName("現場マスタ");
+  const genbaMasterData = genbaMasterSheet ? genbaMasterSheet.getRange(2, 1, genbaMasterSheet.getLastRow() - 1, 3).getValues() : [];
+  const demenSheet = ssMaster.getSheetByName("出面");
+
+  const statusColumn = 3; 
+  const startRow = 2;
+  const lastRow = sheet.getLastRow();
+  if (lastRow < startRow) return;
+
+  // 1行ずつ処理
+  for (let currentRow = startRow; currentRow <= lastRow; currentRow++) {
+    // タイムアウト監視 (5分)
+    if (new Date().getTime() - startTime > 300000) break;
+
+    // 処理の直前にセルの値を直接再取得して二重処理を防止
+    const currentStatus = sheet.getRange(currentRow, statusColumn).getValue();
+    if (currentStatus !== "") continue; 
+
+    const inputTextData = sheet.getRange(currentRow, 2).getValue();
+    if (!inputTextData || inputTextData.trim() === "") continue;
+
+    // 即座に「処理中」にして確定させる
+    sheet.getRange(currentRow, statusColumn).setValue("処理中...");
+    SpreadsheetApp.flush();
+
+    // AI呼び出し
+    const filledPrompt = PROMPT_TEMPLATE.replace("###INPUT_TEXT_DATA_PLACEHOLDER###", inputTextData);
+    const geminiResponse = callGeminiApi(filledPrompt);
+
+    if (geminiResponse && !geminiResponse.startsWith("エラー:") && !geminiResponse.startsWith("APIエラー:")) {
+      const { parentData, childData } = parseGeminiResponseToTables(geminiResponse);
+      
+      const lock = LockService.getScriptLock();
+      try {
+        lock.waitLock(30000);
+        
+        if (parentData.length > 0 && demenSheet) {
+          const idMap = {};
+          const rowsToWrite = [];
+
+          for (const row of parentData) {
+            // AIが生成した一時ID（確実に文字列として取得し、トリムする）
+            const geminiId = String(row[0]).trim();
+            let [_, dateStr, genbaName, ninzu, kaishaName, shukkin, kuruma] = row;
+            const currentId = generateAppSheetId();
+
+            // 会社名の照合
+            const normKaisha = _normalize(kaishaName);
+            const kaishaCode = normKaisha === "" ? "" : (kaishaMasterMap[normKaisha] || `⚠️ ${kaishaName}`);
+
+            let genbaCode = "";
+            if (genbaName.trim() !== "") {
+              const companyCodeForSearch = kaishaMasterMap[normKaisha] || ""; 
+              genbaCode = findGenbaCode(companyCodeForSearch, genbaName, genbaMasterData);
+              if (!genbaCode) genbaCode = `⚠️ ${genbaName}`;
+            }
+
+            // マッピング保存（一時ID -> AppSheet用ID）
+            idMap[geminiId] = currentId;
+
+            const newRow = new Array(26).fill('');
+            newRow[0] = currentId;
+            newRow[1] = dateStr; 
+            newRow[7] = kaishaCode;
+            newRow[8] = genbaCode;
+            newRow[9] = shukkin;
+            newRow[11] = ninzu;
+            newRow[26] = kuruma;
+            rowsToWrite.push(newRow);
+          }
+
+          // 親書き込み
+          if(rowsToWrite.length > 0) {
+            demenSheet.getRange(demenSheet.getLastRow() + 1, 1, rowsToWrite.length, 27).setValues(rowsToWrite);
+          }
+
+          // 子（協力会社）書き込み
+          if (childData.length > 0) {
+            const updatedChildData = [];
+            
+            for (const childRow of childData) {
+              // 子テーブルにある親ID参照（文字列として取得してトリム）
+              const geminiIdRef = String(childRow[1]).trim();
+              const pId = idMap[geminiIdRef];
+              
+              // ★重要：紐付けに成功した場合のみ書き込み用リストに追加（スキップ処理）
+              if (pId) {
+                childRow[1] = pId;
+                
+                // 子テーブル自身のIDもAppSheet用に新設（空または短い場合）
+                if (!childRow[0] || String(childRow[0]).length < 5) {
+                  childRow[0] = generateAppSheetId();
+                }
+                updatedChildData.push(childRow);
+              } else {
+                console.warn(`子データの紐付けに失敗したためスキップしました (Ref ID: ${geminiIdRef})`);
+              }
+            }
+
+            // 有効な紐付けデータがある場合のみシートへ追記
+            if (updatedChildData.length > 0) {
+              appendDataToSheet("協力会社集計", updatedChildData);
+            }
+          }
+          SpreadsheetApp.flush();
+        }
+
+        // 成功ステータス
+        sheet.getRange(currentRow, statusColumn).setValue("処理済み");
+
+        try {
+          sendMessage(TARGET_USER_ID, `✅ 登録完了: ${inputTextData.substring(0, 10)}...`);
+        } catch (e) {}
+
+      } catch (e) {
+        console.error(e);
+        sheet.getRange(currentRow, statusColumn).setValue(`エラー: ${e.message}`);
+      } finally {
+        lock.releaseLock();
+      }
+    } else {
+      sheet.getRange(currentRow, statusColumn).setValue(`AIエラー: ${geminiResponse}`);
+    }
   }
 }
 
-/**
- * 2. テスト送信用の関数
- */
-function sendTestMessage() {
-  const userId = PROPS.getProperty('USER_ID');
-  debugLog("🔧 テスト送信実行: " + userId + " 宛て");
-  
-  if (!userId) {
-    debugLog("❌ エラー: USER_ID未設定");
-    return;
-  }
-  sendMessage(userId, "GASからのテスト送信成功です！Botの設定は正常です。🎉");
+// ==================================================
+// 便利関数
+// ==================================================
+function _normalize(str) {
+  if (!str) return "";
+  return str.toString().trim().replace(/[！-～]/g, s => String.fromCharCode(s.charCodeAt(0) - 0xFEE0)).replace(/\s+/g, "");
 }
 
-/**
- * 3. メッセージ送信の実行関数
- */
 function sendMessage(userId, text) {
-  try {
-    const token = getAccessToken();
-    const botId = PROPS.getProperty('BOT_ID');
-    const url = `https://www.worksapis.com/v1.0/bots/${botId}/users/${userId}/messages`;
-    
-    const payload = {
-      content: {
-        type: 'text',
-        text: text
-      }
-    };
-
-    const options = {
-      method: 'post',
-      headers: {
-        'Authorization': 'Bearer ' + token,
-        'Content-Type': 'application/json'
-      },
-      payload: JSON.stringify(payload),
-      muteHttpExceptions: true
-    };
-
-    const response = UrlFetchApp.fetch(url, options);
-    const resCode = response.getResponseCode();
-    
-    if (resCode === 201) {
-      debugLog("📤 送信成功: " + text);
-    } else {
-      debugLog("❌ 送信失敗 (Code " + resCode + "): " + response.getContentText());
-    }
-    
-  } catch (e) {
-    debugLog("❌ sendMessage関数エラー: " + e.toString());
-  }
+  const token = getAccessToken();
+  const url = `https://www.worksapis.com/v1.0/bots/${BOT_ID}/users/${userId}/messages`;
+  UrlFetchApp.fetch(url, {
+    method: 'post',
+    headers: {'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json'},
+    payload: JSON.stringify({content: {type: 'text', text: text}}),
+    muteHttpExceptions: true
+  });
 }
 
-/**
- * 4. アクセストークン取得関数 (ライブラリ不使用版)
- * GAS標準機能のみでJWTを生成します
- */
 function getAccessToken() {
   const privateKey = PROPS.getProperty('PRIVATE_KEY');
   const clientId = PROPS.getProperty('CLIENT_ID');
   const serviceAccount = PROPS.getProperty('SERVICE_ACCOUNT');
-  
-  if (!privateKey || !clientId || !serviceAccount) {
-    throw new Error("プロパティ設定不備");
-  }
-
-  // 1. ヘッダー作成
-  const header = {
-    alg: 'RS256',
-    typ: 'JWT'
-  };
-
-  // 2. クレームセット作成
   const now = Math.floor(Date.now() / 1000);
-  const claim = {
-    iss: clientId,
-    sub: serviceAccount,
-    iat: now,
-    exp: now + 3600
-  };
-  
-  // 3. 署名生成 (ライブラリを使わずGAS標準機能で実装)
-  const toSign = base64UrlEncode(JSON.stringify(header)) + '.' + base64UrlEncode(JSON.stringify(claim));
-  const signatureBytes = Utilities.computeRsaSha256Signature(toSign, privateKey);
-  const signature = base64UrlEncode(signatureBytes);
-  const jwt = toSign + '.' + signature;
-
-  // 4. トークン要求
-  const url = 'https://auth.worksmobile.com/oauth2/v2.0/token';
-  const payload = {
-    grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
-    assertion: jwt,
-    client_id: clientId,
-    client_secret: PROPS.getProperty('CLIENT_SECRET'),
-    scope: 'bot'
-  };
-
-  const options = {
+  const claim = { iss: clientId, sub: serviceAccount, iat: now, exp: now + 3600 };
+  const toSign = Utilities.base64EncodeWebSafe(JSON.stringify({alg: 'RS256', typ: 'JWT'})).replace(/=+$/, '') + '.' + Utilities.base64EncodeWebSafe(JSON.stringify(claim)).replace(/=+$/, '');
+  const signature = Utilities.base64EncodeWebSafe(Utilities.computeRsaSha256Signature(toSign, privateKey)).replace(/=+$/, '');
+  const res = UrlFetchApp.fetch('https://auth.worksmobile.com/oauth2/v2.0/token', {
     method: 'post',
-    payload: payload,
-    muteHttpExceptions: true
-  };
-
-  const response = UrlFetchApp.fetch(url, options);
-  const json = JSON.parse(response.getContentText());
-  
-  if (json.error) {
-    throw new Error("トークン取得APIエラー: " + json.error);
-  }
-  return json.access_token;
-}
-
-/**
- * ヘルパー関数: Base64URLエンコード
- */
-function base64UrlEncode(input) {
-  let bytes;
-  if (typeof input === 'string') {
-    bytes = Utilities.newBlob(input).getBytes();
-  } else {
-    bytes = input;
-  }
-  return Utilities.base64Encode(bytes)
-    .replace(/\+/g, '-')
-    .replace(/\//g, '_')
-    .replace(/=+$/, '');
+    payload: { grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer', assertion: toSign + '.' + signature, client_id: clientId, client_secret: PROPS.getProperty('CLIENT_SECRET'), scope: 'bot' }
+  });
+  return JSON.parse(res.getContentText()).access_token;
 }
