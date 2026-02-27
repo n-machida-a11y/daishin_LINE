@@ -151,10 +151,9 @@ function processAppSheetEntries() {
               if (pId) {
                 childRow[1] = pId;
                 
-                // 子テーブル自身のIDもAppSheet用に新設（空または短い場合）
-                if (!childRow[0] || String(childRow[0]).length < 5) {
-                  childRow[0] = generateAppSheetId();
-                }
+                // 子テーブル自身のIDは常に新規採番する
+                // Geminiが5文字以上のダミーIDを返した場合でも再採番することで主キーの重複を防ぐ
+                childRow[0] = generateAppSheetId();
                 updatedChildData.push(childRow);
               } else {
                 console.warn(`子データの紐付けに失敗したためスキップしました (Ref ID: ${geminiIdRef})`);
